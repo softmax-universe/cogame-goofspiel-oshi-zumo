@@ -1,4 +1,4 @@
-# CI for a Coworld game repo (Metta-AI/cogame-goofspiel-oshi-zumo).
+# CI for a Coworld game repo (softmax-universe/cogame-goofspiel-oshi-zumo).
 #
 # Goes to:  .github/workflows/ci.yml  in the coworld repo.
 # Substitute: goofspiel-oshi-zumo  (lowercase game slug, e.g. bullwhip)
