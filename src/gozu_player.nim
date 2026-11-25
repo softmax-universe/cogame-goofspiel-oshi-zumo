@@ -79,6 +79,10 @@ when isMainModule:
         of "final":
           echo "gozu player: final scores ", payload{"scores"}
           break
+        of "error":
+          echo "gozu player: server error: ", payload{"message"}.getStr()
+          if payload{"fatal"}.getBool():
+            break
         else:
           discard
       except CatchableError as error:

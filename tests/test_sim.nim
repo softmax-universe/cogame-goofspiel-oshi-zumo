@@ -389,37 +389,3 @@ suite "11 every shipped game_config constructs a Sim":
       check sim.seats == node["num_agents"].getInt()
       check sim.config.maxRounds >= 2
       check sim.legalBids(0).len > 0
-
-suite "12 forfeit scoring is zero-sum and bounded":
-  test "single and multi-seat forfeit in goofspiel and oshi-zumo":
-    var goof1 = initSim(goofConfig(seed = 1))
-    goof1.beginRound()
-    goof1.forfeit(@[2])
-    check goof1.done
-    check goof1.reason == "forfeit"
-    check goof1.ending == "forfeit"
-    check abs(goof1.score(2) + 1.0) < 1e-9
-    for seat in [0, 1, 3]:
-      check abs(goof1.score(seat) - 1.0 / 3.0) < 1e-9
-
-    var goof3 = initSim(goofConfig(seed = 1))
-    goof3.beginRound()
-    goof3.forfeit(@[0, 1, 2])
-    check abs(goof3.score(3) - 1.0) < 1e-9
-    for seat in [0, 1, 2]:
-      check abs(goof3.score(seat) + 1.0 / 3.0) < 1e-9
-
-    var goofAll = initSim(goofConfig(seed = 1))
-    goofAll.beginRound()
-    goofAll.forfeit(@[0, 1, 2, 3])
-    for seat in 0 ..< 4:
-      check goofAll.score(seat) == 0.0
-
-    var oshi = initSim(oshiConfig(seed = 1))
-    oshi.beginRound()
-    oshi.forfeit(@[0])
-    check oshi.done
-    check oshi.reason == "forfeit"
-    check oshi.ending == "forfeit"
-    check oshi.score(0) == -1.0
-    check oshi.score(1) == 1.0

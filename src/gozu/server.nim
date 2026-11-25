@@ -56,6 +56,7 @@ type
     externalBids: seq[Decision]
     bidReceived: seq[bool]
     seatFailed: seq[bool]
+    seatFailureKind: seq[FailureKind]
     seatFailReason: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
@@ -250,11 +251,9 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     state.broadcastLocked()
 
   if state.trajectory.isSome:
-    let episodeStatus =
-      if state.sim.reason == "complete": esCompleted
-      elif state.sim.reason == "deadline": esTruncated
-      else: esFailed
-    state.trajectory.get().finish(episodeStatus, results, results["scores"])
+    state.trajectory.get().finish(
+      (if state.sim.reason == "deadline": esTruncated else: esCompleted),
+      results, results["scores"])
     state.trajectory.get().writeEventsToUri(getEnv("COGAME_SAVE_TRAJECTORY_URI"))
 
   sleep(500)
@@ -274,6 +273,45 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   sleep(ShutdownGraceSeconds * 1000)
   echo "gozu: episode complete, shutting down"
   quit(0)
+
+proc abortEpisode(failurePayload: JsonNode) =
+  ## Terminates an unfinished episode unscored with failure diagnostics.
+  ## Writes no official results.json scores or invented winner/payoff.
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    let errorFrame = %*{
+      "type": "error",
+      "fatal": true,
+      "done": true,
+      "round": failurePayload["round"],
+      "failure_kind": failurePayload["failure_kind"],
+      "message": failurePayload["reason"]
+    }
+    for slot, socket in state.playerSockets:
+      var frame = copy(errorFrame)
+      frame["slot"] = %slot
+      try:
+        socket.send($frame)
+      except CatchableError:
+        discard
+
+  if state.trajectory.isSome:
+    state.trajectory.get().finish(esFailed, failurePayload, newJNull())
+    state.trajectory.get().writeEventsToUri(getEnv("COGAME_SAVE_TRAJECTORY_URI"))
+
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if failureUri.len > 0:
+    writeArtifact(
+      failureUri, $failurePayload, "application/json",
+      "COGAME_PLAYER_FAILURE_METHOD"
+    )
+
+  sleep(200)
+  echo "gozu: episode aborted (", failurePayload["failure_kind"].getStr(),
+    "): ", failurePayload["reason"].getStr()
+  quit(1)
 
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
@@ -365,6 +403,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           seats.add(seat)
           state.bidReceived[seat] = false
           state.seatFailed[seat] = false
+          state.seatFailureKind[seat] = fkNone
           state.seatFailReason[seat] = ""
           state.externalBids[seat] = Decision()
           if not state.external[seat]:
@@ -395,7 +434,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       ## External policies receive the same public table and a seat-private
       ## memo. Their sealed bids arrive while the LLM batch is in flight.
       ## Wait through the round's reserve; missing or rejected external bids
-      ## forfeit rather than substituting a scripted move.
+      ## abort the episode unscored rather than substituting a scripted move.
       let bidDeadline = roundStart + reserve - 2.0
       while epochTime() < bidDeadline:
         var allResolved = true
@@ -407,46 +446,71 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           break
         sleep(20)
 
-      var endedByForfeit = false
+      var abortPayload: JsonNode = nil
       withLock stateLock:
-        var forfeitedSeats: seq[int]
+        var failedSeats: seq[int]
         for index, seat in seats:
           var decision = decisions[index]
           if external[seat]:
             if state.seatFailed[seat]:
               decision = state.externalBids[seat]
               decision.failed = true
+              decision.failureKind =
+                if state.seatFailureKind[seat] != fkNone: state.seatFailureKind[seat]
+                else: fkModel
               decision.failureReason = state.seatFailReason[seat]
             elif state.bidReceived[seat]:
               decision = state.externalBids[seat]
             else:
               decision.failed = true
+              decision.failureKind = fkMissing
               decision.failureReason = "bid deadline expired"
           if not decision.failed and decision.bid notin state.sim.legalBids(seat):
             decision.failed = true
+            decision.failureKind = fkModel
             decision.failureReason = "bid " & $decision.bid & " is not legal for this seat"
           decisions[index] = decision
           if decision.failed:
-            forfeitedSeats.add(seat)
+            failedSeats.add(seat)
 
-        if forfeitedSeats.len > 0:
-          for seat in forfeitedSeats:
+        if failedSeats.len > 0:
+          var episodeKind = fkMissing
+          var failedDetails = newJArray()
+          var summaryParts: seq[string]
+          for seat in failedSeats:
+            let kind =
+              if decisions[seat].failureKind != fkNone: decisions[seat].failureKind
+              else: fkModel
+            if kind == fkInfra:
+              episodeKind = fkInfra
+            elif kind == fkModel and episodeKind != fkInfra:
+              episodeKind = fkModel
+            let cleanReason = cleanText(decisions[seat].failureReason, MaxErrorLen)
             echo "gozu: round ", state.sim.round + 1, " ",
-              state.sim.names[seat], " forfeited (",
-              cleanText(decisions[seat].failureReason, MaxErrorLen), ")"
+              state.sim.names[seat], " failed (", kind, ": ", cleanReason, ")"
+            summaryParts.add(state.sim.names[seat] & " [" & $kind & "]: " & cleanReason)
+            failedDetails.add(%*{
+              "slot": seat,
+              "name": config.players[seat].name,
+              "alias": state.sim.names[seat],
+              "control": (if external[seat]: "external" else: "internal"),
+              "failure_kind": $kind,
+              "reason": cleanReason
+            })
           if state.trajectory.isSome:
-            for seat in forfeitedSeats:
+            for seat in failedSeats:
               var attempts = decisions[seat].nativeAttempts
               for attempt in attempts.mitems:
                 attempt.policy = config.players[seat].name
                 attempt.accepted = false
               let sysPrompt = systemPrompt(simCopy, seat, state.selection)
               let usrPrompt = userPrompt(simCopy, seat, prompts[seat])
+              let kind =
+                if decisions[seat].failureKind != fkNone: decisions[seat].failureKind
+                else: fkModel
               let status =
-                if attempts.len > 0 or decisions[seat].failureReason != "bid deadline expired":
-                  asRejected
-                else:
-                  asMissing
+                if kind == fkModel: asRejected
+                else: asMissing
               state.trajectory.get().recordDecision(
                 $simCopy.round & "-" & $seat,
                 $seat,
@@ -456,6 +520,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                   "operator_prompt": prompts[seat],
                   "system": sysPrompt,
                   "user": usrPrompt,
+                  "failure_kind": $kind,
                   "failure_reason": decisions[seat].failureReason
                 },
                 attempts,
@@ -464,9 +529,15 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 status,
                 terminal = true
               )
-          state.sim.forfeit(forfeitedSeats)
-          state.broadcastLocked()
-          endedByForfeit = true
+          abortPayload = %*{
+            "status": "failed",
+            "failure_kind": $episodeKind,
+            "reason": summaryParts.join("; "),
+            "round": state.sim.round,
+            "rounds_played": state.sim.roundsPlayed,
+            "mode": $config.mode,
+            "failed_seats": failedDetails
+          }
         else:
           var bids: seq[int]
           var says: seq[string]
@@ -478,8 +549,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             bids.add(decision.bid)
             says.add(decision.say)
             notes.add(decision.notes)
-            wasScripted.add(not external[seat] and
-              (scripted[seat] != skNone or client.isOffline()))
+            wasScripted.add(not external[seat] and scripted[seat] != skNone)
             fellBack.add(false)
             echo "gozu: round ", state.sim.round + 1, " ",
               state.sim.names[seat], " bids ", decision.bid,
@@ -506,8 +576,8 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
              else: "")
           state.broadcastLocked()
 
-      if endedByForfeit:
-        break
+      if not abortPayload.isNil:
+        abortEpisode(abortPayload)
 
       ## Pace between rounds so spectators can read the table.
       if config.turnDelayMs > 0:
@@ -746,6 +816,7 @@ proc websocketHandler(
           if state.external[slot] and state.sim.roundOpen() and
               not state.bidReceived[slot] and not state.seatFailed[slot]:
             state.seatFailed[slot] = true
+            state.seatFailureKind[slot] = fkModel
             state.seatFailReason[slot] = reason
             roundForError = state.sim.round
         try:
@@ -765,6 +836,7 @@ proc websocketHandler(
             if state.external[slot] and state.sim.roundOpen() and
                 not state.bidReceived[slot] and not state.seatFailed[slot]:
               state.seatFailed[slot] = true
+              state.seatFailureKind[slot] = fkMissing
               state.seatFailReason[slot] = "disconnected"
         state.globalSockets.excl(websocket)
 
@@ -846,6 +918,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.externalBids = newSeq[Decision](config.players.len)
   state.bidReceived = newSeq[bool](config.players.len)
   state.seatFailed = newSeq[bool](config.players.len)
+  state.seatFailureKind = newSeq[FailureKind](config.players.len)
   state.seatFailReason = newSeq[string](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 

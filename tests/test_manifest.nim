@@ -54,13 +54,13 @@ suite "21 config_schema":
         check property.hasKey("minItems")
         check property.hasKey("maxItems")
 
-  test "results_schema pins the three reason values and the six endings":
+  test "results_schema pins the two reason values and the five endings":
     let schema = manifest["game"]["results_schema"]
     check schema["properties"]["reason"]["enum"].to(seq[string]) ==
-      @["complete", "deadline", "forfeit"]
+      @["complete", "deadline"]
     check schema["properties"]["ending"]["enum"].to(seq[string]) ==
       @["prizes-exhausted", "pushout", "coins-exhausted", "round-cap",
-        "wall-clock", "forfeit"]
+        "wall-clock"]
     for name, property in schema["properties"]:
       if property{"type"}.getStr() == "array":
         checkpoint(name)
@@ -127,18 +127,20 @@ suite "22 the 0.1.42+ upload contract":
     doAssert manifest{"game"}{"runnable"}{"env"}{"ANTHROPIC_API_KEY_URI"}.isNil,
       "hosted LLM uses the platform sidecar without provider secrets"
 
-suite "23 the certification fixture seats every declared runnable":
-  test "player ids resolve both ways":
-    ## A fixture that seats only one of the declared runnables fails cert
-    ## `players_missing` (raid 0.1.2 -> 0.1.3).
+suite "23 player roster and purely scripted offline certification":
+  test "native model player is first, scripted baseline is separate, and certification is scripted":
+    let players = manifest["player"]
+    check players.len == 2
+    check players[0]["id"].getStr() == "goofspiel-oshi-zumo-player"
+    check players[0]["run"].to(seq[string]) == @["/bin/goofspiel-oshi-zumo-player"]
+    check players[0]{"env"}{"PLAYER_SCRIPTED"}.isNil
+    check players[1]["id"].getStr() == "goofspiel-oshi-zumo-scripted"
+    check players[1]["run"].to(seq[string]) == @["/bin/goofspiel-oshi-zumo-player"]
+    check players[1]["env"]["PLAYER_SCRIPTED"].getStr() == "match"
     var declared: seq[string]
-    for player in manifest["player"]:
+    for player in players:
       declared.add(player["id"].getStr())
-    var seated: seq[string]
     for slot in manifest["certification"]["players"]:
       let id = slot["player_id"].getStr()
       check id in declared
-      seated.add(id)
-    for id in declared:
-      checkpoint(id)
-      check id in seated
+      check id == "goofspiel-oshi-zumo-scripted"

@@ -7,18 +7,18 @@
 ## goes out as ONE parallel batch (curly.RequestBatch + makeRequests, the
 ## `decideAll` shape ported from cogame-bullwhip/src/bullwhip/llm.nim);
 ## invalid replies are retried once with the legal set, and anything still
-## failing is reported as a failed decision (forfeit) rather than silently
-## substituting a scripted move.
+## failing is reported as a failed decision (aborting the episode unscored)
+## rather than silently substituting a scripted move or inventing a forfeit.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials configured at startup (offline certification), prompt
-## seats use the built-in `match` baseline immediately with no network waits.
-## The same scripted bots are also fieldable policies: a player that registers
-## as scripted plays one deliberately, LLM or not.
+## Prompt seats require LLM credentials; with no credentials configured, prompt
+## seats fail with an infrastructure error rather than falling back to scripted
+## moves. Scripted baselines (`match`, `hoard`) play only seats that explicitly
+## register as scripted.
 
 import
   std/[json, math, options, os, strutils],
@@ -34,6 +34,14 @@ const
   BedrockAnthropicVersion = "bedrock-2023-05-31"
 
 type
+  LlmInfraError* = object of GozuError
+
+  FailureKind* = enum
+    fkNone = "none"
+    fkModel = "model"
+    fkMissing = "missing"
+    fkInfra = "infrastructure"
+
   ScriptKind* = enum
     skNone = "none"
     skMatch = "match"
@@ -45,6 +53,7 @@ type
     say*: string
     notes*: string      ## "" when the reply carried none
     failed*: bool       ## true when the seat failed to produce a legal bid
+    failureKind*: FailureKind
     failureReason*: string
 
   LlmTransport = enum
@@ -156,7 +165,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "gozu llm: no LLM credentials; using scripted fallback"
+    echo "gozu llm: no LLM credentials configured"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -552,30 +561,39 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a GozuError describing why there is
-  ## none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+  ## The text of one batched reply, or a GozuError / LlmInfraError describing
+  ## why there is none. Auth failures disable the client; model-access and
+  ## throttle failures rotate the Bedrock model for the next batch.
   if error.len > 0:
-    raise newException(GozuError, "llm transport: " &
+    raise newException(LlmInfraError, "llm transport: " &
       cleanText(error, MaxErrorLen))
   if response.code == 401 or response.code == 403:
     let detail = cleanText(response.body, MaxErrorLen)
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(GozuError, "bedrock model access denied: " & detail)
+      raise newException(LlmInfraError, "bedrock model access denied: " & detail)
     client.disabled = true
-    raise newException(GozuError,
+    raise newException(LlmInfraError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = cleanText(response.body, MaxErrorLen)
     discard client.tryNextBedrockModel("throttled")
-    raise newException(GozuError, "llm throttled (429): " & detail)
+    raise newException(LlmInfraError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(GozuError, "anthropic error " & $response.code &
+    raise newException(LlmInfraError, "anthropic error " & $response.code &
       ": " & cleanText(response.body, MaxErrorLen))
-  let payload = parseJson(response.body)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except JsonParsingError as parseErr:
+    raise newException(LlmInfraError, "invalid provider JSON: " &
+      cleanText(parseErr.msg, MaxErrorLen))
+  if payload.kind != JObject:
+    raise newException(LlmInfraError, "provider response must be a JSON object")
   if payload{"stop_reason"}.getStr() == "refusal":
     raise newException(GozuError, "anthropic refusal")
+  if not payload.hasKey("content") or payload["content"].kind != JArray:
+    raise newException(LlmInfraError, "provider response missing content array")
   for contentBlock in payload["content"]:
     if contentBlock{"type"}.getStr() == "text":
       result.add(contentBlock{"text"}.getStr())
@@ -617,10 +635,10 @@ proc decideAll*(
   scripted: seq[ScriptKind],
   selection: PromptSelection
 ): seq[Decision] =
-  ## One decision per seat in `seats`, in order. Genuine scripted seats and
-  ## offline no-credentials runs use the deterministic baseline; when an LLM
-  ## transport is configured, failures are surfaced as failed decisions rather
-  ## than silently substituting a scripted move.
+  ## One decision per seat in `seats`, in order. Explicitly scripted seats use
+  ## their deterministic baseline; prompt seats require an active LLM transport
+  ## and surface model or infrastructure failures without substituting a
+  ## scripted move.
   ## `prompts` and `scripted` are indexed by SEAT.
   ##
   ## Every LLM seat is called in ONE parallel batch, because the rules make
@@ -633,9 +651,12 @@ proc decideAll*(
     if kind != skNone:
       result[index] = scriptedAction(sim, seat, kind)
     elif client.isOffline():
-      result[index] = scriptedAction(sim, seat, skMatch)
+      result[index].failed = true
+      result[index].failureKind = fkInfra
+      result[index].failureReason = "no LLM credentials configured"
     elif client.disabled:
       result[index].failed = true
+      result[index].failureKind = fkInfra
       result[index].failureReason = "llm client disabled after auth failure"
     else:
       open.add(index)
@@ -683,15 +704,20 @@ proc decideAll*(
         evidence.response = %raw
         evidence.rejectionReason = some(error.msg)
         result[index].nativeAttempts.add(evidence)
+        result[index].failureKind =
+          if error of LlmInfraError: fkInfra
+          else: fkModel
         result[index].failureReason = error.msg
-        echo "gozu llm: seat ", seat, " attempt ", attempt, " failed: ",
-          cleanText(error.msg, MaxErrorLen)
+        echo "gozu llm: seat ", seat, " attempt ", attempt, " failed (",
+          result[index].failureKind, "): ", cleanText(error.msg, MaxErrorLen)
         stillOpen.add(index)
     open = stillOpen
   for index in open:
     let seat = seats[index]
     result[index].failed = true
+    if result[index].failureKind == fkNone:
+      result[index].failureKind = fkModel
     if result[index].failureReason.len == 0:
       result[index].failureReason = "model failed to produce a legal bid"
-    echo "gozu llm: seat ", seat, " forfeited: ",
-      cleanText(result[index].failureReason, MaxErrorLen)
+    echo "gozu llm: seat ", seat, " aborted (", result[index].failureKind,
+      "): ", cleanText(result[index].failureReason, MaxErrorLen)
