@@ -51,6 +51,7 @@ type
     scripted*: seq[bool]           ## per seat, this round
     fellBack*: seq[bool]           ## per seat, this round
     fallbacks*: seq[int]
+    forfeited*: seq[bool]          ## per seat, if ended by forfeit
     lowBidStandAside*: seq[int]    ## numerator of collusionIndex
     winners*: seq[int]             ## this round's top bidders
     award*: seq[float]             ## this round's award per seat
@@ -131,6 +132,7 @@ proc initSim*(config: GameConfig): Sim =
   result.scripted = newSeq[bool](n)
   result.fellBack = newSeq[bool](n)
   result.fallbacks = newSeq[int](n)
+  result.forfeited = newSeq[bool](n)
   result.lowBidStandAside = newSeq[int](n)
   result.award = newSeq[float](n)
   result.coins = newSeq[int](n)
@@ -230,6 +232,18 @@ proc pushesNeeded*(sim: Sim, seat: int): int =
   else: sim.position + 1
 
 proc score*(sim: Sim, seat: int): float =
+  if sim.reason == "forfeit":
+    var forfeitedCount = 0
+    for flag in sim.forfeited:
+      if flag:
+        inc forfeitedCount
+    let survivors = sim.seats - forfeitedCount
+    if forfeitedCount == 0 or survivors == 0:
+      return 0.0
+    if forfeitedCount <= survivors:
+      return if sim.forfeited[seat]: -1.0 else: forfeitedCount.float / survivors.float
+    else:
+      return if sim.forfeited[seat]: -survivors.float / forfeitedCount.float else: 1.0
   case sim.config.mode
   of mGoofspiel:
     let n = sim.seats
@@ -446,6 +460,38 @@ proc endEarly*(sim: var Sim) =
     return
   sim.settle("deadline", "wall-clock")
 
+proc forfeit*(sim: var Sim, seats: seq[int]) =
+  ## Ends the episode by forfeit when one or more seats fail to submit a
+  ## valid legal bid. The same proc applies on record and on replay playback.
+  if sim.done:
+    return
+  for seat in seats:
+    if seat >= 0 and seat < sim.seats:
+      sim.forfeited[seat] = true
+  if sim.config.mode == mOshiZumo:
+    if sim.forfeited[0] and not sim.forfeited[1]:
+      sim.outcome[0] = 0.0
+      sim.outcome[1] = 1.0
+    elif sim.forfeited[1] and not sim.forfeited[0]:
+      sim.outcome[0] = 1.0
+      sim.outcome[1] = 0.0
+    else:
+      sim.outcome[0] = 0.5
+      sim.outcome[1] = 0.5
+  sim.done = true
+  sim.reason = "forfeit"
+  sim.ending = "forfeit"
+  var event = blankEvent(evEnd)
+  event.round = sim.roundsPlayed
+  event.reason = sim.reason
+  event.ending = sim.ending
+  for seat in 0 ..< sim.seats:
+    if sim.forfeited[seat]:
+      event.forfeited.add(seat)
+    event.scores.add(sim.score(seat))
+    event.collusionIndex.add(sim.collusionIndex(seat))
+  sim.addEvent(event)
+
 # ---- Results ----------------------------------------------------------------
 
 proc resultsJson*(sim: Sim): JsonNode =
@@ -600,6 +646,10 @@ proc eventToJson*(event: GameEvent): JsonNode =
   of evEnd:
     result["reason"] = %event.reason
     result["ending"] = %event.ending
+    if event.forfeited.len > 0:
+      var forfeited = newJArray()
+      for value in event.forfeited: forfeited.add(%value)
+      result["forfeited"] = forfeited
     var scores = newJArray()
     for value in event.scores: scores.add(%value)
     var collusion = newJArray()
@@ -646,6 +696,8 @@ proc eventFromJson*(node: JsonNode): GameEvent =
     for value in node["scripted"]: result.scripted.add(value.getBool())
   if node.hasKey("fellBack"):
     for value in node["fellBack"]: result.fellBack.add(value.getBool())
+  if node.hasKey("forfeited"):
+    for value in node["forfeited"]: result.forfeited.add(value.getInt())
   if node.hasKey("scores"):
     for value in node["scores"]: result.scores.add(value.getFloat())
   if node.hasKey("collusionIndex"):
@@ -768,7 +820,10 @@ proc replayMatch*(config: GameConfig, events: seq[GameEvent]): seq[Sim] =
             "the recorded ending does not match the re-derivation")
         pending.delete(0)
       elif not sim.done:
-        ## A wall-clock stop is not derivable from the bids — the SAME
-        ## settle applies it here as on the recording path.
-        sim.settle(event.reason, event.ending)
+        if event.reason == "forfeit":
+          sim.forfeit(event.forfeited)
+        else:
+          ## A wall-clock stop is not derivable from the bids — the SAME
+          ## settle applies it here as on the recording path.
+          sim.settle(event.reason, event.ending)
     result.add(sim)

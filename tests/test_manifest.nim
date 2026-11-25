@@ -54,13 +54,13 @@ suite "21 config_schema":
         check property.hasKey("minItems")
         check property.hasKey("maxItems")
 
-  test "results_schema pins the two reason values and the five endings":
+  test "results_schema pins the three reason values and the six endings":
     let schema = manifest["game"]["results_schema"]
     check schema["properties"]["reason"]["enum"].to(seq[string]) ==
-      @["complete", "deadline"]
+      @["complete", "deadline", "forfeit"]
     check schema["properties"]["ending"]["enum"].to(seq[string]) ==
       @["prizes-exhausted", "pushout", "coins-exhausted", "round-cap",
-        "wall-clock"]
+        "wall-clock", "forfeit"]
     for name, property in schema["properties"]:
       if property{"type"}.getStr() == "array":
         checkpoint(name)

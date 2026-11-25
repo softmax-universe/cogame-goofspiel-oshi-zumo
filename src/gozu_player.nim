@@ -4,7 +4,6 @@
 ##
 ## PLAYER_SCRIPTED=match|hoard registers the seat as one of the built-in
 ## baselines instead: the server plays it deterministically, no LLM.
-## (1/true/yes are accepted as synonyms for match.)
 ##
 ## To field your own policy, reuse this image and set PLAYER_PROMPT:
 ##   coworld upload-policy <image> --name my-gozu \
@@ -19,7 +18,6 @@ const DefaultPrompt = """
 Bid to win the prizes that are worth winning and no others. Spend in
 proportion to value, keep your high cards for the high prizes, and watch
 what every rival has already spent - their remaining resources are public.
-Reply with only the JSON object.
 """
 
 when isMainModule:
@@ -30,8 +28,13 @@ when isMainModule:
   if prompt.len == 0:
     prompt = DefaultPrompt
   let scripted = getEnv("PLAYER_SCRIPTED").strip().toLowerAscii()
+  if scripted.len > 0 and scripted notin ["match", "hoard"]:
+    quit("PLAYER_SCRIPTED must be match or hoard, got: " & scripted, 1)
   proc promptFrame(): string =
-    $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
+    if scripted.len > 0:
+      $ %*{"type": "prompt", "prompt": prompt, "scripted": scripted}
+    else:
+      $ %*{"type": "prompt", "prompt": prompt}
 
   echo "gozu player: connecting to game"
   let socket = newWebSocket(url)

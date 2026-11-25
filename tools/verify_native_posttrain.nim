@@ -59,6 +59,33 @@ for eventIndex, event in events:
           let normalized = %*{"bid": parsed.bid, "say": parsed.say, "notes": parsed.notes}
           doAssert normalized == action
       inc index
+if frames[^1].reason == "forfeit":
+  var forfeitState = frames[^2]
+  if not forfeitState.roundOpen():
+    forfeitState.beginRound()
+  while index < captures.len - 1:
+    let capture = captures[index]
+    doAssert capture["event_type"].getStr() == "decision"
+    doAssert capture["game"].getStr() == traceGame
+    doAssert capture["decision_index"].getInt() == index
+    doAssert capture["action_status"].getStr() in ["rejected", "missing"]
+    doAssert capture["selected_attempt_id"].kind == JNull
+    doAssert capture["executed_action"].kind == JNull
+    let seat = parseInt(capture["seat"].getStr())
+    let operatorPrompt = capture["observation"]["operator_prompt"].getStr()
+    let system = systemPrompt(forfeitState, seat, selection)
+    let user = userPrompt(forfeitState, seat, operatorPrompt)
+    doAssert capture["observation"]["system"].getStr() == system
+    doAssert capture["observation"]["user"].getStr() == user
+    doAssert capture["observation"]["prompt_template"] == selection.promptMetadata(system, user)
+    for attempt in capture["attempts"]:
+      doAssert not attempt["accepted"].getBool()
+      if attempt["origin"].getStr() == "model":
+        doAssert attempt["prompt"][0]["content"].getStr() == system
+        doAssert attempt["prompt"][1]["content"].getStr().startsWith(user)
+        doAssert attempt["request"]["system"].getStr() == system
+        doAssert attempt["request"]["messages"][0]["content"] == attempt["prompt"][1]["content"]
+    inc index
 doAssert index == captures.len - 1
 echo $(%*{"seed": config.seed, "scores": replay["results"]["scores"],
   "full_schedule": fullSchedule, "decisions": index, "policy_names": replay["policyNames"]})

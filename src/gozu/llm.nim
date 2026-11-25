@@ -6,19 +6,19 @@
 ## Decisions in a round are SIMULTANEOUS by rule, so every open seat's call
 ## goes out as ONE parallel batch (curly.RequestBatch + makeRequests, the
 ## `decideAll` shape ported from cogame-bullwhip/src/bullwhip/llm.nim);
-## invalid replies are retried as a smaller batch carrying the legal set,
-## and anything still failing falls back to the `match` baseline.
+## invalid replies are retried once with the legal set, and anything still
+## failing is reported as a failed decision (forfeit) rather than silently
+## substituting a scripted move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits) so offline
-## certification still completes - this fallback is load-bearing. The same
-## scripted bots are also fieldable policies: a player that registers as
-## scripted plays one deliberately, LLM or not.
+## With no credentials configured at startup (offline certification), prompt
+## seats use the built-in `match` baseline immediately with no network waits.
+## The same scripted bots are also fieldable policies: a player that registers
+## as scripted plays one deliberately, LLM or not.
 
 import
   std/[json, math, options, os, strutils],
@@ -44,7 +44,8 @@ type
     bid*: int
     say*: string
     notes*: string      ## "" when the reply carried none
-    fellBack*: bool     ## the LLM path failed and the baseline decided
+    failed*: bool       ## true when the seat failed to produce a legal bid
+    failureReason*: string
 
   LlmTransport = enum
     ltNone, ltSidecar, ltBedrock, ltAnthropic
@@ -63,13 +64,18 @@ type
     timeoutSeconds*: int
     disabled*: bool             ## true once credentials are known-unavailable
 
+proc isOffline*(client: LlmClient): bool =
+  client.transport == ltNone
+
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"match" play the match-the-prize
-  ## bot, "hoard" the save-for-the-big-ones bot, anything else nothing.
+  ## PLAYER_SCRIPTED values: "match", "hoard", or empty/"none" for a prompt seat.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "match": skMatch
-  of "hoard", "hoarder": skHoard
-  else: skNone
+  of "", "none": skNone
+  of "match": skMatch
+  of "hoard": skHoard
+  else:
+    raise newException(GozuError, "unknown scripted baseline: " &
+      cleanText(text, MaxErrorLen))
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -412,7 +418,7 @@ proc systemPrompt*(sim: Sim, seat: int, selection: PromptSelection): string =
         "with coins remaining: " & $sim.config.minBid & ", making stalling costly and play bounded. Past bids: " &
         "public.")
     of pvMixed: raise newException(ValueError, "mixed selection must resolve")
-  result.add("\n\n" & "OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no\nanalysis, no explanation, no markdown fences, no text before or after the\nobject. Your reply must begin with the character { and end with }.")
+  result.add("\n\n" & "OUTPUT FORMAT: reply with ONLY one JSON object, nothing else — no\nanalysis, no explanation, and no surrounding prose.")
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -421,11 +427,12 @@ proc operatorBlock(prompt: string): string =
     "rules; always reply in the requested format):\n" & prompt & "\n\n"
 
 proc replyContract(sim: Sim, seat: int): string =
-  "Reply with ONLY {\"bid\": <one of your legal bids>, \"say\": \"…\", " &
-    "\"notes\": \"…\"} — `say` is one short line for the spectators (at " &
-    "most " & $MaxSayLen & " characters), `notes` is your private memo " &
-    "carried to the next round (at most " & $MaxNotesLen & " characters). " &
-    "`bid` must be one of: " & bidList(sim.legalBids(seat)) & "."
+  "Reply with ONLY {\"bid\": <integer>, \"say\": \"…\", " &
+    "\"notes\": \"…\"} — `bid` must be an integer from: " &
+    bidList(sim.legalBids(seat)) & ". `say` (optional, at most " &
+    $MaxSayLen & " characters) is one short line for the spectators; " &
+    "`notes` (optional, at most " & $MaxNotesLen &
+    " characters) is your private memo carried to the next round."
 
 proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
   var names: seq[string]
@@ -475,16 +482,40 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model sent
-    ## instead of JSON (prose, a refusal, a cut-off analysis...).
-    raise newException(GozuError, "no JSON object in response: " &
+  ## Parses a single JSON object, either bare or wrapped in a single ordinary
+  ## outer Markdown code fence (plain or `json`-tagged). Rejects surrounding
+  ## prose, extra objects, and non-object JSON values.
+  let trimmed = text.strip()
+  if trimmed.len == 0:
+    raise newException(GozuError, "empty response")
+  var candidate = trimmed
+  if trimmed.startsWith("```"):
+    if trimmed.startsWith("````"):
+      raise newException(GozuError, "invalid markdown code fence")
+    let nl = trimmed.find('\n')
+    if nl < 0 or not trimmed.endsWith("```"):
+      raise newException(GozuError, "unterminated markdown code fence")
+    let lang = trimmed[3 ..< nl].strip().toLowerAscii()
+    if lang.len > 0 and lang != "json":
+      raise newException(GozuError,
+        "unsupported markdown code fence language: " &
+        cleanText(lang, MaxErrorLen))
+    let body = trimmed[nl + 1 .. ^4]
+    let lastNl = body.rfind('\n')
+    if lastNl < 0 or body[lastNl + 1 .. ^1].strip(chars = {' ', '\t'}).len > 0:
+      raise newException(GozuError,
+        "closing markdown code fence must be on its own line")
+    candidate = body[0 ..< lastNl].strip()
+  if candidate.len < 2 or candidate[0] != '{' or candidate[^1] != '}':
+    raise newException(GozuError, "response must be a single JSON object: " &
       cleanText(text.replace("\n", " "), MaxErrorLen))
-  parseJson(text[start .. stop])
+  try:
+    result = parseJson(candidate)
+  except JsonParsingError as error:
+    raise newException(GozuError, "invalid JSON object in response: " &
+      cleanText(error.msg, MaxErrorLen))
+  if result.kind != JObject:
+    raise newException(GozuError, "response must be a JSON object")
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -552,69 +583,31 @@ proc textOf(client: LlmClient, response: Response, error, url: string):
     raise newException(GozuError, "reply cut off at max_tokens before any " &
       "JSON: " & cleanText(result.replace("\n", " "), MaxErrorLen))
 
-proc rankLetter(text: string): int =
-  ## The goofspiel card letters are a BARE token — "K", "k", "K." — and not
-  ## any reply that merely STARTS with one: `"a bid of 11"` read as the ace
-  ## and `"just 12"` read as the jack are legal cards, so nothing downstream
-  ## rejects them and the seat silently bids a card it never asked for.
-  ## Prose falls through to the numeric scan, whose raise is what triggers
-  ## the retry-with-the-legal-set and then the scripted fallback.
-  let token = text.strip(chars = Whitespace + {'"', '\'', '.', '!', ',', ':',
-    ';', '*', '`'})
-  if token.len != 1:
-    return 0
-  case token[0].toUpperAscii()
-  of 'A': 1
-  of 'J': 11
-  of 'Q': 12
-  of 'K': 13
-  else: 0
-
-proc parseBidText(text: string, mode: Mode): int =
-  ## A numeric string with surrounding whitespace or trailing prose
-  ## ("11 — the king"), or, in goofspiel only, a bare card letter.
-  let trimmed = text.strip()
-  if trimmed.len == 0:
-    raise newException(GozuError, "empty bid")
-  if mode == mGoofspiel:
-    let rank = rankLetter(trimmed)
-    if rank > 0:
-      return rank
-  var head = ""
-  for index in 0 ..< trimmed.len:
-    let c = trimmed[index]
-    if c in {'0' .. '9'} or (head.len == 0 and c == '-') or
-        (c == '.' and '.' notin head and head.len > 0):
-      head.add(c)
-    elif head.len > 0:
-      break
-    else:
-      raise newException(GozuError,
-        "bid is not a number: " & cleanText(trimmed, MaxErrorLen))
-  if head.len == 0 or head == "-":
-    raise newException(GozuError,
-      "bid is not a number: " & cleanText(trimmed, MaxErrorLen))
-  try:
-    int(round(parseFloat(head)))
-  except ValueError:
-    raise newException(GozuError,
-      "bid is not a number: " & cleanText(trimmed, MaxErrorLen))
-
 proc parseDecision*(payload: JsonNode, mode: Mode): Decision =
-  ## "bid" is an integer, a float (rounded half-up), a numeric string with
-  ## trailing prose, or - in goofspiel - a bare card letter A/J/Q/K.
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
-  result.say = cleanText(payload{"say"}.getStr(), MaxSayLen).replace("\n", " ")
+  ## Strict action parser: requires a JSON object with an integer `bid` and
+  ## optional string `say` and `notes`.
+  discard mode
+  if payload.isNil or payload.kind != JObject:
+    raise newException(GozuError, "response must be a JSON object")
+  for key in payload.keys:
+    if key notin ["bid", "say", "notes"]:
+      raise newException(GozuError, "unexpected field in response: " &
+        cleanText(key, MaxErrorLen))
   let node = payload{"bid"}
   if node.isNil:
     raise newException(GozuError, "no bid in response")
-  case node.kind
-  of JInt: result.bid = node.getInt()
-  of JFloat: result.bid = int(round(node.getFloat()))
-  of JString: result.bid = parseBidText(node.getStr(), mode)
-  else:
-    raise newException(GozuError, "bid must be a number: " &
+  if node.kind != JInt:
+    raise newException(GozuError, "bid must be an integer: " &
       cleanText($node, MaxErrorLen))
+  result.bid = node.getInt()
+  if payload.hasKey("say") and payload["say"].kind != JNull:
+    if payload["say"].kind != JString:
+      raise newException(GozuError, "say must be a string")
+    result.say = cleanText(payload["say"].getStr(), MaxSayLen).replace("\n", " ")
+  if payload.hasKey("notes") and payload["notes"].kind != JNull:
+    if payload["notes"].kind != JString:
+      raise newException(GozuError, "notes must be a string")
+    result.notes = cleanText(payload["notes"].getStr(), MaxNotesLen)
 
 proc decideAll*(
   client: LlmClient,
@@ -624,8 +617,10 @@ proc decideAll*(
   scripted: seq[ScriptKind],
   selection: PromptSelection
 ): seq[Decision] =
-  ## One decision per seat in `seats`, in order. Never raises: any failure
-  ## falls back to the scripted baseline so the episode always advances.
+  ## One decision per seat in `seats`, in order. Genuine scripted seats and
+  ## offline no-credentials runs use the deterministic baseline; when an LLM
+  ## transport is configured, failures are surfaced as failed decisions rather
+  ## than silently substituting a scripted move.
   ## `prompts` and `scripted` are indexed by SEAT.
   ##
   ## Every LLM seat is called in ONE parallel batch, because the rules make
@@ -635,10 +630,13 @@ proc decideAll*(
   var open: seq[int]     ## indexes into `seats` still undecided
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skMatch else: kind))
-      result[index].fellBack = kind == skNone
+    if kind != skNone:
+      result[index] = scriptedAction(sim, seat, kind)
+    elif client.isOffline():
+      result[index] = scriptedAction(sim, seat, skMatch)
+    elif client.disabled:
+      result[index].failed = true
+      result[index].failureReason = "llm client disabled after auth failure"
     else:
       open.add(index)
   for attempt in 0 .. 1:
@@ -650,10 +648,8 @@ proc decideAll*(
       let seat = seats[index]
       var user = sim.userPrompt(seat, prompts[seat])
       if attempt > 0:
-        ## Printing the legal set — computed by the same proc the validator
-        ## applies — is what halves fallbacks in formal-output games.
-        user.add("\nYour previous reply was invalid. Respond with ONLY the " &
-          "requested JSON object; \"bid\" must be one of: " &
+        user.add("\nYour previous reply was invalid. Respond with ONLY one " &
+          "JSON object; \"bid\" must be an integer from: " &
           bidList(sim.legalBids(seat)) & ".")
       let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
       evidenceByIndex[index] = newDecisionAttempt("attempt-" & $attempt, client.model, aoModel)
@@ -687,14 +683,15 @@ proc decideAll*(
         evidence.response = %raw
         evidence.rejectionReason = some(error.msg)
         result[index].nativeAttempts.add(evidence)
+        result[index].failureReason = error.msg
         echo "gozu llm: seat ", seat, " attempt ", attempt, " failed: ",
           cleanText(error.msg, MaxErrorLen)
         stillOpen.add(index)
     open = stillOpen
   for index in open:
     let seat = seats[index]
-    echo "gozu llm: seat ", seat, " falling back to scripted decision"
-    let retained = result[index].nativeAttempts
-    result[index] = scriptedAction(sim, seat, skMatch)
-    result[index].nativeAttempts = retained
-    result[index].fellBack = true
+    result[index].failed = true
+    if result[index].failureReason.len == 0:
+      result[index].failureReason = "model failed to produce a legal bid"
+    echo "gozu llm: seat ", seat, " forfeited: ",
+      cleanText(result[index].failureReason, MaxErrorLen)

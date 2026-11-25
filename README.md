@@ -49,9 +49,12 @@ and the array sums to 0. Goofspiel: `score_i = (N·share_i − 1)/(N − 1)` whe
 `share_i` is the seat's share of the prize value awarded — at four seats that
 is `(points − 22.75)/68.25`, so the equal share scores 0 and taking everything
 scores +1. Oshi-Zumo: +1 / −1, and 0/0 on a draw. `results.reason` is
-`complete` or `deadline`; the finer ending rides in `results.ending`
-(`prizes-exhausted`, `pushout`, `coins-exhausted`, `round-cap`, `wall-clock`).
+`complete`, `deadline`, or `forfeit`; the finer ending rides in `results.ending`
+(`prizes-exhausted`, `pushout`, `coins-exhausted`, `round-cap`, `wall-clock`,
+`forfeit`).
 A `deadline` episode is a real result — the game is fully scored at the stop.
+A `forfeit` episode ends immediately without substituting a fallback move when
+a model or external player fails to submit a valid legal bid.
 
 **The gasp.** One predicate in both modes: `overbid` when `margin >= 6`, the
 top bid over the best bid strictly below it. It gets its own event, its own
@@ -129,9 +132,10 @@ connecting. At each open round, the `state.observation` object gives the seat's
 legal bids, face-up prize or token position, public resources and bid history,
 and its own private notes. The player replies with
 `{"type":"bid","round":R,"bid":N,"say":"...","notes":"..."}`.
-The game accepts one legal bid for that round, reveals all bids together, and
-uses the `match` baseline if an external player does not reply before the
-round deadline.
+The game accepts one strict legal integer bid for that round, reveals all bids
+together, and ends the episode by forfeit (without substituting a fallback move)
+if an external player sends a rejected reply, disconnects, or misses the round
+deadline.
 
 
 ## Private training evidence

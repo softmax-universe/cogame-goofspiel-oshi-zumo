@@ -100,6 +100,14 @@ proc wallClock(): Recorded =
     result.playRound(bids)
   result.stop()
 
+proc forfeitEnding(): Recorded =
+  result = start(goofConfig(seed = 21))
+  result.playRound(@[1, 2, 3, 4])
+  result.sim.beginRound()
+  result.snap()
+  result.sim.forfeit(@[1])
+  result.snap()
+
 suite "16 record -> re-derive, for every ending":
   test "complete / prizes-exhausted":
     let rec = prizesExhausted()
@@ -133,6 +141,18 @@ suite "16 record -> re-derive, for every ending":
     let frames = replayMatch(rec.config, rec.sim.events)
     check frames[^1].done
     check frames[^1].ending == "wall-clock"
+
+  test "forfeit / forfeit":
+    let rec = forfeitEnding()
+    check rec.sim.reason == "forfeit"
+    check rec.sim.ending == "forfeit"
+    check rec.sim.roundsPlayed == 1
+    checkRederives(rec)
+    let frames = replayMatch(rec.config, rec.sim.events)
+    check frames[^1].done
+    check frames[^1].reason == "forfeit"
+    check frames[^1].ending == "forfeit"
+    check abs(frames[^1].score(1) + 1.0) < 1e-9
 
 # ---- 17: a tampered recording is a raised error, not a silent drift -------
 

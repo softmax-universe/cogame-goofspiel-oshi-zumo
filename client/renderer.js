@@ -699,6 +699,8 @@
       case "wall-clock":
         return "deadline — stopped after " + rounds + " of " +
           (results.maxRounds || rounds) + " rounds";
+      case "forfeit":
+        return "forfeit — a player failed to submit a legal bid";
       default:
         return results.reason || "";
     }

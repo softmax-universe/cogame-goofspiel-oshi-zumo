@@ -81,6 +81,7 @@ type
     ## end
     reason*: string
     ending*: string
+    forfeited*: seq[int]
     scores*: seq[float]
     collusionIndex*: seq[float]
 

@@ -144,7 +144,7 @@ when isMainModule:
       response = %*{"response": $(if textMode: %*{"bid": teacher.bid, "say": teacher.say, "notes": teacher.notes} else: %*{"bid": teacher.bid})}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
+      let action = extractJsonObject(request["response"].getStr())
       let parsed = parseDecision(action, game.config.mode)
       doAssert parsed.bid in game.legalBids(seat)
       bids.add(parsed.bid)

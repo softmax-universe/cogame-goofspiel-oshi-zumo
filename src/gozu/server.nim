@@ -55,6 +55,8 @@ type
     external: seq[bool]
     externalBids: seq[Decision]
     bidReceived: seq[bool]
+    seatFailed: seq[bool]
+    seatFailReason: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -248,9 +250,11 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
     state.broadcastLocked()
 
   if state.trajectory.isSome:
-    state.trajectory.get().finish(
-      (if state.sim.reason == "deadline": esTruncated else: esCompleted),
-      results, results["scores"])
+    let episodeStatus =
+      if state.sim.reason == "complete": esCompleted
+      elif state.sim.reason == "deadline": esTruncated
+      else: esFailed
+    state.trajectory.get().finish(episodeStatus, results, results["scores"])
     state.trajectory.get().writeEventsToUri(getEnv("COGAME_SAVE_TRAJECTORY_URI"))
 
   sleep(500)
@@ -360,6 +364,9 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         for seat in 0 ..< config.players.len:
           seats.add(seat)
           state.bidReceived[seat] = false
+          state.seatFailed[seat] = false
+          state.seatFailReason[seat] = ""
+          state.externalBids[seat] = Decision()
           if not state.external[seat]:
             llmSeats.add(seat)
         simCopy = state.sim
@@ -374,7 +381,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
       var usedLlm = false
       for seat in llmSeats:
-        if scripted[seat] == skNone and not client.disabled:
+        if scripted[seat] == skNone and not client.isOffline() and not client.disabled:
           usedLlm = true
 
       ## The slow part (Claude, ONE parallel batch for the round) runs
@@ -387,70 +394,120 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
       ## External policies receive the same public table and a seat-private
       ## memo. Their sealed bids arrive while the LLM batch is in flight.
-      ## Wait only through the round's existing model reserve, then use the
-      ## ordinary baseline for missing seats so the episode still settles.
+      ## Wait through the round's reserve; missing or rejected external bids
+      ## forfeit rather than substituting a scripted move.
       let bidDeadline = roundStart + reserve - 2.0
       while epochTime() < bidDeadline:
-        var allReceived = true
+        var allResolved = true
         withLock stateLock:
           for seat in seats:
-            if external[seat] and not state.bidReceived[seat]:
-              allReceived = false
-        if allReceived:
+            if external[seat] and not state.bidReceived[seat] and not state.seatFailed[seat]:
+              allResolved = false
+        if allResolved:
           break
         sleep(20)
 
+      var endedByForfeit = false
       withLock stateLock:
-        var bids: seq[int]
-        var says: seq[string]
-        var notes: seq[string]
-        var wasScripted: seq[bool]
-        var fellBack: seq[bool]
+        var forfeitedSeats: seq[int]
         for index, seat in seats:
           var decision = decisions[index]
           if external[seat]:
-            if state.bidReceived[seat]:
+            if state.seatFailed[seat]:
+              decision = state.externalBids[seat]
+              decision.failed = true
+              decision.failureReason = state.seatFailReason[seat]
+            elif state.bidReceived[seat]:
               decision = state.externalBids[seat]
             else:
-              decision = scriptedAction(state.sim, seat, skMatch)
-              decision.fellBack = true
-          if decision.bid notin state.sim.legalBids(seat):
-            echo "gozu: seat ", seat, " bid ", decision.bid,
-              " rejected; using scripted fallback"
-            decision = scriptedAction(state.sim, seat, skMatch)
-            decision.fellBack = true
+              decision.failed = true
+              decision.failureReason = "bid deadline expired"
+          if not decision.failed and decision.bid notin state.sim.legalBids(seat):
+            decision.failed = true
+            decision.failureReason = "bid " & $decision.bid & " is not legal for this seat"
           decisions[index] = decision
-          bids.add(decision.bid)
-          says.add(decision.say)
-          notes.add(decision.notes)
-          wasScripted.add(not external[seat] and
-            (scripted[seat] != skNone or client.disabled))
-          fellBack.add(decision.fellBack)
-          echo "gozu: round ", state.sim.round + 1, " ",
-            state.sim.names[seat], " bids ", decision.bid,
-            (if decision.say.len > 0: " says \"" & decision.say & "\"" else: ""),
-            " at ", (epochTime() - gameStart).int, "s"
-        state.sim.applyBids(bids, says, notes, wasScripted, fellBack)
-        if state.trajectory.isSome:
+          if decision.failed:
+            forfeitedSeats.add(seat)
+
+        if forfeitedSeats.len > 0:
+          for seat in forfeitedSeats:
+            echo "gozu: round ", state.sim.round + 1, " ",
+              state.sim.names[seat], " forfeited (",
+              cleanText(decisions[seat].failureReason, MaxErrorLen), ")"
+          if state.trajectory.isSome:
+            for seat in forfeitedSeats:
+              var attempts = decisions[seat].nativeAttempts
+              for attempt in attempts.mitems:
+                attempt.policy = config.players[seat].name
+                attempt.accepted = false
+              let sysPrompt = systemPrompt(simCopy, seat, state.selection)
+              let usrPrompt = userPrompt(simCopy, seat, prompts[seat])
+              let status =
+                if attempts.len > 0 or decisions[seat].failureReason != "bid deadline expired":
+                  asRejected
+                else:
+                  asMissing
+              state.trajectory.get().recordDecision(
+                $simCopy.round & "-" & $seat,
+                $seat,
+                %*{
+                  "prompt_template": state.selection.promptMetadata(sysPrompt, usrPrompt),
+                  "control": (if external[seat]: "external" else: "internal"),
+                  "operator_prompt": prompts[seat],
+                  "system": sysPrompt,
+                  "user": usrPrompt,
+                  "failure_reason": decisions[seat].failureReason
+                },
+                attempts,
+                none(string),
+                newJNull(),
+                status,
+                terminal = true
+              )
+          state.sim.forfeit(forfeitedSeats)
+          state.broadcastLocked()
+          endedByForfeit = true
+        else:
+          var bids: seq[int]
+          var says: seq[string]
+          var notes: seq[string]
+          var wasScripted: seq[bool]
+          var fellBack: seq[bool]
           for index, seat in seats:
             let decision = decisions[index]
-            let origin =
-              if decision.fellBack: aoFallback
-              elif decision.nativeAttempts.len > 0: aoModel
-              elif external[seat]: aoUnknown
-              else: aoTeacher
-            state.trajectory.get().recordExecutedDecision($simCopy.round & "-" & $seat,
-              $seat, config.players[seat].name,
-              %*{"prompt_template": state.selection.promptMetadata(systemPrompt(simCopy, seat, state.selection), userPrompt(simCopy, seat, prompts[seat])), "control": (if external[seat]: "external" else: "internal"), "operator_prompt": prompts[seat], "system": systemPrompt(simCopy, seat, state.selection),
-                "user": userPrompt(simCopy, seat, prompts[seat])},
-              %*{"bid": decision.bid, "say": decision.say, "notes": decision.notes},
-              decision.nativeAttempts, origin, systemPrompt(simCopy, seat, state.selection),
-              userPrompt(simCopy, seat, prompts[seat]), state.sim.done)
-        echo "gozu: round ", state.sim.round + 1, " resolved, margin ",
-          state.sim.margin,
-          (if config.mode == mOshiZumo: " token " & $state.sim.position
-           else: "")
-        state.broadcastLocked()
+            bids.add(decision.bid)
+            says.add(decision.say)
+            notes.add(decision.notes)
+            wasScripted.add(not external[seat] and
+              (scripted[seat] != skNone or client.isOffline()))
+            fellBack.add(false)
+            echo "gozu: round ", state.sim.round + 1, " ",
+              state.sim.names[seat], " bids ", decision.bid,
+              (if decision.say.len > 0: " says \"" & decision.say & "\"" else: ""),
+              " at ", (epochTime() - gameStart).int, "s"
+          state.sim.applyBids(bids, says, notes, wasScripted, fellBack)
+          if state.trajectory.isSome:
+            for index, seat in seats:
+              let decision = decisions[index]
+              let origin =
+                if decision.nativeAttempts.len > 0: aoModel
+                elif external[seat]: aoUnknown
+                else: aoTeacher
+              state.trajectory.get().recordExecutedDecision($simCopy.round & "-" & $seat,
+                $seat, config.players[seat].name,
+                %*{"prompt_template": state.selection.promptMetadata(systemPrompt(simCopy, seat, state.selection), userPrompt(simCopy, seat, prompts[seat])), "control": (if external[seat]: "external" else: "internal"), "operator_prompt": prompts[seat], "system": systemPrompt(simCopy, seat, state.selection),
+                  "user": userPrompt(simCopy, seat, prompts[seat])},
+                %*{"bid": decision.bid, "say": decision.say, "notes": decision.notes},
+                decision.nativeAttempts, origin, systemPrompt(simCopy, seat, state.selection),
+                userPrompt(simCopy, seat, prompts[seat]), state.sim.done)
+          echo "gozu: round ", state.sim.round + 1, " resolved, margin ",
+            state.sim.margin,
+            (if config.mode == mOshiZumo: " token " & $state.sim.position
+             else: "")
+          state.broadcastLocked()
+
+      if endedByForfeit:
+        break
 
       ## Pace between rounds so spectators can read the table.
       if config.turnDelayMs > 0:
@@ -596,15 +653,26 @@ proc websocketHandler(
         return
       try:
         let payload = parseJson(message.data)
-        if payload{"type"}.getStr() == "prompt":
-          let prompt = cleanText(payload{"prompt"}.getStr(), MaxPromptLen)
-          let node = payload{"scripted"}
+        if payload.kind != JObject:
+          raise newException(GozuError, "player frame must be a JSON object")
+        let kindNode = payload{"type"}
+        if kindNode.isNil or kindNode.kind != JString:
+          raise newException(GozuError, "player frame requires string type")
+        case kindNode.getStr()
+        of "prompt":
+          for key in payload.keys:
+            if key notin ["type", "prompt", "scripted"]:
+              raise newException(GozuError, "unexpected field in prompt frame: " & key)
+          var prompt = ""
+          if payload.hasKey("prompt") and payload["prompt"].kind != JNull:
+            if payload["prompt"].kind != JString:
+              raise newException(GozuError, "prompt must be a string")
+            prompt = cleanText(payload["prompt"].getStr(), MaxPromptLen)
           var kind = skNone
-          if not node.isNil:
-            case node.kind
-            of JBool: kind = if node.getBool(): skMatch else: skNone
-            of JString: kind = parseScriptKind(node.getStr())
-            else: discard
+          if payload.hasKey("scripted") and payload["scripted"].kind != JNull:
+            if payload["scripted"].kind != JString:
+              raise newException(GozuError, "scripted must be a string")
+            kind = parseScriptKind(payload["scripted"].getStr())
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = kind
@@ -612,33 +680,79 @@ proc websocketHandler(
             state.external[slot] = false
           echo "gozu: slot ", slot, " delivered a prompt (", prompt.len,
             " chars", (if kind != skNone: ", scripted " & $kind else: ""), ")"
-        elif payload{"type"}.getStr() == "register" and
-            payload{"control"}.getStr() == "external":
+        of "register":
+          for key in payload.keys:
+            if key notin ["type", "control"]:
+              raise newException(GozuError, "unexpected field in register frame: " & key)
+          let controlNode = payload{"control"}
+          if controlNode.isNil or controlNode.kind != JString or
+              controlNode.getStr() != "external":
+            raise newException(GozuError, "register requires control=\"external\"")
           withLock stateLock:
             state.registered[slot] = true
             state.external[slot] = true
           echo "gozu: slot ", slot, " registered an external policy"
-        elif payload{"type"}.getStr() == "bid":
-          let round = payload["round"].getInt()
-          let bid = payload["bid"].getInt()
-          let say = cleanText(payload{"say"}.getStr(), MaxSayLen)
-          let notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+        of "bid":
+          for key in payload.keys:
+            if key notin ["type", "round", "bid", "say", "notes", "attempts"]:
+              raise newException(GozuError, "unexpected field in bid frame: " & key)
+          let roundNode = payload{"round"}
+          if roundNode.isNil or roundNode.kind != JInt:
+            raise newException(GozuError, "bid frame requires integer round")
+          let bidNode = payload{"bid"}
+          if bidNode.isNil or bidNode.kind != JInt:
+            raise newException(GozuError, "bid frame requires integer bid")
+          var say = ""
+          if payload.hasKey("say") and payload["say"].kind != JNull:
+            if payload["say"].kind != JString:
+              raise newException(GozuError, "say must be a string")
+            say = cleanText(payload["say"].getStr(), MaxSayLen).replace("\n", " ")
+          var notes = ""
+          if payload.hasKey("notes") and payload["notes"].kind != JNull:
+            if payload["notes"].kind != JString:
+              raise newException(GozuError, "notes must be a string")
+            notes = cleanText(payload["notes"].getStr(), MaxNotesLen)
+          var attempts: seq[DecisionAttempt]
+          if payload.hasKey("attempts") and payload["attempts"].kind != JNull:
+            if payload["attempts"].kind != JArray:
+              raise newException(GozuError, "attempts must be an array")
+            for attempt in payload["attempts"]:
+              attempts.add(readAttemptEvidence(attempt))
+          let round = roundNode.getInt()
+          let bid = bidNode.getInt()
           withLock stateLock:
-            if state.external[slot] and state.sim.roundOpen() and
-                state.sim.round == round and
-                bid in state.sim.legalBids(slot) and
-                not state.bidReceived[slot]:
-              state.externalBids[slot] = Decision(
-                bid: bid, say: say, notes: notes)
-              if payload.hasKey("attempts"):
-                for attempt in payload["attempts"]:
-                  state.externalBids[slot].nativeAttempts.add(readAttemptEvidence(attempt))
-              state.bidReceived[slot] = true
-              echo "gozu: slot ", slot, " submitted sealed bid for round ",
-                round
+            if not state.external[slot]:
+              raise newException(GozuError, "seat is not registered as external")
+            if not state.sim.roundOpen():
+              raise newException(GozuError, "no round is open")
+            if state.bidReceived[slot] or state.seatFailed[slot]:
+              raise newException(GozuError, "bid already resolved for this round")
+            if state.sim.round != round:
+              raise newException(GozuError,
+                "bid round " & $round & " does not match open round " & $state.sim.round)
+            if bid notin state.sim.legalBids(slot):
+              raise newException(GozuError,
+                "bid " & $bid & " is not legal for this seat")
+            state.externalBids[slot] = Decision(
+              bid: bid, say: say, notes: notes, nativeAttempts: attempts)
+            state.bidReceived[slot] = true
+            echo "gozu: slot ", slot, " submitted sealed bid for round ", round
+        else:
+          raise newException(GozuError, "unknown player frame type: " & kindNode.getStr())
       except CatchableError as error:
-        echo "gozu: ignoring bad player frame: ",
-          cleanText(error.msg, MaxErrorLen)
+        let reason = cleanText(error.msg, MaxErrorLen)
+        var roundForError = -1
+        withLock stateLock:
+          if state.external[slot] and state.sim.roundOpen() and
+              not state.bidReceived[slot] and not state.seatFailed[slot]:
+            state.seatFailed[slot] = true
+            state.seatFailReason[slot] = reason
+            roundForError = state.sim.round
+        try:
+          websocket.send($ %*{"type": "error", "round": roundForError, "message": reason})
+        except CatchableError:
+          discard
+        echo "gozu: slot ", slot, " rejected player frame: ", reason
     of ErrorEvent:
       discard
     of CloseEvent:
@@ -648,6 +762,10 @@ proc websocketHandler(
           state.socketSlots.del(websocket)
           if state.playerSockets.getOrDefault(slot) == websocket:
             state.playerSockets.del(slot)
+            if state.external[slot] and state.sim.roundOpen() and
+                not state.bidReceived[slot] and not state.seatFailed[slot]:
+              state.seatFailed[slot] = true
+              state.seatFailReason[slot] = "disconnected"
         state.globalSockets.excl(websocket)
 
 proc buildRouter(replayMode: bool): Router =
@@ -727,6 +845,8 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.external = newSeq[bool](config.players.len)
   state.externalBids = newSeq[Decision](config.players.len)
   state.bidReceived = newSeq[bool](config.players.len)
+  state.seatFailed = newSeq[bool](config.players.len)
+  state.seatFailReason = newSeq[string](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)
