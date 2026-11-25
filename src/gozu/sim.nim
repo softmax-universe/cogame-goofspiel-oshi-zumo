@@ -327,14 +327,18 @@ proc applyBids*(sim: var Sim, bids: seq[int], says, notes: seq[string],
       raise newException(GozuError,
         "seat " & $seat & " bid " & $bids[seat] & ", which is not legal")
 
+  var roundNotes = newSeq[string](n)
   for seat in 0 ..< n:
     sim.bids[seat] = bids[seat]
     sim.bidsMade[seat] += 1
     sim.spent[seat] += bids[seat]
     if seat < says.len:
       sim.says[seat] = cleanText(says[seat], MaxSayLen).replace("\n", " ")
-    if seat < notes.len and notes[seat].len > 0:
-      sim.notes[seat] = cleanText(notes[seat], MaxNotesLen)
+    if seat < notes.len:
+      let note = cleanText(notes[seat], MaxNotesLen)
+      if note.len > 0:
+        roundNotes[seat] = note
+        sim.notes[seat] = note
     if seat < scripted.len:
       sim.scripted[seat] = scripted[seat]
     if seat < fellBack.len:
@@ -403,7 +407,7 @@ proc applyBids*(sim: var Sim, bids: seq[int], says, notes: seq[string],
     reveal.points.add(sim.points[seat])
     reveal.award.add(sim.award[seat])
     reveal.says.add(sim.says[seat])
-    reveal.notes.add(sim.notes[seat])
+    reveal.notes.add(roundNotes[seat])
     reveal.scripted.add(sim.scripted[seat])
     reveal.fellBack.add(sim.fellBack[seat])
   sim.addEvent(reveal)

@@ -18,7 +18,11 @@ binary, output, revision = sys.argv[1:4]
 
 
 def choose_action(user):
-    return {"bid": int(re.search(r"YOUR LEGAL BIDS: ([0-9]+)", user)[1])}
+    bid = int(re.search(r"YOUR LEGAL BIDS: ([0-9]+)", user)[1])
+    if "Round 1 of " in user:
+        return {"bid": bid, "say": "opening", "notes": "save 4"}
+    assert "YOUR NOTES FROM EARLIER ROUNDS:\nsave 4\n" in user, user
+    return {"bid": bid}
 
 
 def run_mode(root: Path, mode: str, config: dict):
