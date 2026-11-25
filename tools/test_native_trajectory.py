@@ -1,4 +1,4 @@
-"""Qualify native host+player round-trip: regular JSON, fenced JSON, retry, invalid/ambiguous object, provider failures, and missing credentials."""
+"""Qualify native host+player round-trip: regular JSON, fenced JSON, invalid/ambiguous object, provider 503/500/401 failures, and missing credentials."""
 
 import json
 import os
@@ -30,7 +30,14 @@ def run_mode(root: Path, mode: str, config: dict):
     folder.mkdir(mode=0o700)
     calls = []
     use_stub = mode != "no_credentials"
-    expect_abort = mode in ("invalid_ambiguous", "provider_failure", "provider_auth_failure", "no_credentials")
+    expect_abort = mode in (
+        "invalid_ambiguous",
+        "seat2_invalid",
+        "provider_unavailable",
+        "provider_failure",
+        "provider_auth_failure",
+        "no_credentials",
+    )
 
     class Fixture(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -39,11 +46,22 @@ def run_mode(root: Path, mode: str, config: dict):
         def do_POST(self):
             assert self.path == "/v1/messages"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            slot = int(self.headers.get("X-Coworld-Player-Slot", "-1"))
             user = request["messages"][0]["content"]
             call_id = str(uuid.uuid4())
+            if mode == "provider_unavailable" and slot == 1:
+                body = b"Service Unavailable"
+                calls.append({"id": call_id, "slot": slot, "request": request, "response": body.decode(), "status": 503})
+                self.send_response(503)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("X-Softmax-Llm-Call-Id", call_id)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if mode == "provider_failure":
                 body = json.dumps({"error": {"type": "api_error", "message": "upstream 500"}}).encode()
-                calls.append({"id": call_id, "request": request, "response": json.loads(body), "status": 500})
+                calls.append({"id": call_id, "slot": slot, "request": request, "response": json.loads(body), "status": 500})
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("X-Softmax-Llm-Call-Id", call_id)
@@ -53,7 +71,7 @@ def run_mode(root: Path, mode: str, config: dict):
                 return
             if mode == "provider_auth_failure":
                 body = json.dumps({"error": {"type": "authentication_error", "message": "invalid api key"}}).encode()
-                calls.append({"id": call_id, "request": request, "response": json.loads(body), "status": 401})
+                calls.append({"id": call_id, "slot": slot, "request": request, "response": json.loads(body), "status": 401})
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("X-Softmax-Llm-Call-Id", call_id)
@@ -65,20 +83,17 @@ def run_mode(root: Path, mode: str, config: dict):
             raw = json.dumps(action, separators=(",", ":"))
             if mode == "fenced":
                 raw = "```json\n" + raw + "\n```"
-            elif mode == "retry" and "previous reply was" not in user:
-                raw = "Here is my bid: " + raw
             elif mode == "invalid_ambiguous":
-                if "previous reply was" not in user:
-                    raw = raw + " " + raw
-                else:
-                    raw = "Here is my bid: " + raw
+                raw = raw + " " + raw
+            elif mode == "seat2_invalid" and slot == 2:
+                raw = "not an action"
             response = {
                 "model": request["model"],
                 "stop_reason": "end_turn",
                 "content": [{"type": "text", "text": raw}],
                 "usage": {"input_tokens": 100, "output_tokens": 20},
             }
-            calls.append({"id": call_id, "request": request, "response": response, "status": 200})
+            calls.append({"id": call_id, "slot": slot, "request": request, "response": response, "status": 200})
             payload = json.dumps(response).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -181,30 +196,39 @@ def run_mode(root: Path, mode: str, config: dict):
         assert not (folder / "replay.json").exists(), f"aborted mode {mode} must not write scored replay.json"
         assert (folder / "player_failure.json").is_file(), f"aborted mode {mode} must write player_failure.json"
         failure = json.loads((folder / "player_failure.json").read_text())
-        assert failure["status"] == "failed", failure
-        assert "scores" not in failure and "points" not in failure, failure
+        assert set(failure.keys()) == {"failed_policy_index", "message", "kind"}, failure
+        assert isinstance(failure["failed_policy_index"], int) and failure["failed_policy_index"] >= 0, failure
+        assert isinstance(failure["message"], str) and 1 <= len(failure["message"]) <= 2000, failure
         assert summary["status"] == "failed", summary
         assert summary["participant_outcomes"] is None, summary
         assert "scores" not in summary["outcome"], summary
-        expected_kind = "model" if mode == "invalid_ambiguous" else "infrastructure"
-        expected_action_status = "rejected" if mode == "invalid_ambiguous" else "missing"
-        assert failure["failure_kind"] == expected_kind, failure
-        assert len(failure["failed_seats"]) == len(config["players"]), failure
+        is_model_failure = mode in ("invalid_ambiguous", "seat2_invalid")
+        expected_internal_kind = "model" if is_model_failure else "infrastructure"
+        expected_coworld_kind = "player_error" if is_model_failure else "episode_inconclusive"
+        expected_action_status = "rejected" if is_model_failure else "missing"
+        assert failure["kind"] == expected_coworld_kind, failure
+        if mode == "seat2_invalid":
+            assert failure["failed_policy_index"] == 2, failure
+        elif mode == "provider_unavailable":
+            assert failure["failed_policy_index"] == 1, failure
+        else:
+            assert failure["failed_policy_index"] == 0, failure
+        assert summary["outcome"]["failure_kind"] == expected_internal_kind, summary
+        expected_failed_count = 1 if mode in ("seat2_invalid", "provider_unavailable") else len(config["players"])
+        assert len(summary["outcome"]["failed_seats"]) == expected_failed_count, summary
         for decision in decisions[:-1]:
             assert decision["action_status"] == expected_action_status, decision
             assert decision["selected_attempt_id"] is None, decision
             assert decision["executed_action"] is None, decision
-            assert decision["observation"]["failure_kind"] == expected_kind, decision
-            if mode == "invalid_ambiguous":
-                assert len(decision["attempts"]) == 2, decision
-            elif mode == "provider_failure":
-                assert len(decision["attempts"]) == 2, decision
-            elif mode == "provider_auth_failure":
-                assert len(decision["attempts"]) == 1, decision
-            elif mode == "no_credentials":
+            assert decision["observation"]["failure_kind"] == expected_internal_kind, decision
+            if mode == "no_credentials":
                 assert len(decision["attempts"]) == 0, decision
                 assert "no LLM credentials" in decision["observation"]["failure_reason"]
-        return {"mode": mode, "aborted": True, "failure_kind": expected_kind, "decisions": len(decisions) - 1, "calls": len(calls)}
+            else:
+                assert len(decision["attempts"]) == 1, decision
+        if use_stub:
+            assert len(calls) == len(config["players"]), f"no retries allowed; got {len(calls)} calls for {mode}"
+        return {"mode": mode, "aborted": True, "kind": expected_coworld_kind, "failed_policy_index": failure["failed_policy_index"], "decisions": len(decisions) - 1, "calls": len(calls)}
 
     assert not (folder / "player_failure.json").exists()
     archive_path = folder / "provider-archive.jsonl"
@@ -233,7 +257,7 @@ def run_mode(root: Path, mode: str, config: dict):
             assert attempt["prompt"][0]["content"] == call["request"]["system"]
             assert attempt["prompt"][1]["content"] == call["request"]["messages"][0]["content"]
         assert decision["action_status"] == "accepted"
-        assert len(decision["attempts"]) == (2 if mode == "retry" else 1)
+        assert len(decision["attempts"]) == 1
         assert decision["attempts"][-1]["parsed_action"] == decision["executed_action"]
     assert results["reason"] == "complete"
     assert results["fallbacks"] == [0, 0, 0, 0]
@@ -288,8 +312,9 @@ config = {
 modes = [
     "accepted",
     "fenced",
-    "retry",
     "invalid_ambiguous",
+    "seat2_invalid",
+    "provider_unavailable",
     "provider_failure",
     "provider_auth_failure",
     "no_credentials",

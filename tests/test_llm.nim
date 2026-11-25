@@ -2,7 +2,7 @@
 ## `parseScriptKind` accept and reject. No action compatibility shims, no
 ## legacy aliases, no guessing from prose or card letters.
 
-import std/[json, unittest]
+import std/[json, strutils, unittest]
 import gozu/[llm, sim]
 
 proc parseReply(raw: string, mode = mGoofspiel): Decision =
@@ -110,3 +110,28 @@ suite "strict scripted baseline parsing":
     for legacy in ["1", "true", "yes", "hoarder", "random"]:
       expect GozuError:
         discard parseScriptKind(legacy)
+
+suite "Coworld GamePlayerFailure serialization":
+  test "maps model and missing failures to player_error and infra to episode_inconclusive":
+    check playerFailureKind(fkModel) == "player_error"
+    check playerFailureKind(fkMissing) == "player_error"
+    check playerFailureKind(fkInfra) == "episode_inconclusive"
+
+  test "emits only closed GamePlayerFailure keys and bounds message length":
+    let modelFail = playerFailureJson(2, fkModel, "Piston [model]: bad json")
+    check modelFail.len == 3
+    check modelFail["failed_policy_index"].getInt() == 2
+    check modelFail["kind"].getStr() == "player_error"
+    check modelFail["message"].getStr() == "Piston [model]: bad json"
+
+    let infraFail = playerFailureJson(0, fkInfra, "anthropic error 503: unavailable")
+    check infraFail.len == 3
+    check infraFail["failed_policy_index"].getInt() == 0
+    check infraFail["kind"].getStr() == "episode_inconclusive"
+    check infraFail["message"].getStr() == "anthropic error 503: unavailable"
+
+    let longMsg = repeat("x", 2500)
+    let capped = playerFailureJson(1, fkInfra, longMsg)
+    check capped["message"].getStr().len <= 2003 # 1999 ASCII + 3-byte ellipsis
+    let emptyMsg = playerFailureJson(0, fkModel, "   ")
+    check emptyMsg["message"].getStr().len >= 1

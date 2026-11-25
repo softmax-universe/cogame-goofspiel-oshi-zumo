@@ -274,8 +274,10 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "gozu: episode complete, shutting down"
   quit(0)
 
-proc abortEpisode(failurePayload: JsonNode) =
+proc abortEpisode(playerFailure, diagnostics: JsonNode) =
   ## Terminates an unfinished episode unscored with failure diagnostics.
+  ## Writes Coworld's closed GamePlayerFailure JSON to COGAME_PLAYER_FAILURE_URI
+  ## and preserves richer game-specific diagnostics in private trajectory/logs.
   ## Writes no official results.json scores or invented winner/payoff.
   withLock stateLock:
     if state.finished:
@@ -285,9 +287,9 @@ proc abortEpisode(failurePayload: JsonNode) =
       "type": "error",
       "fatal": true,
       "done": true,
-      "round": failurePayload["round"],
-      "failure_kind": failurePayload["failure_kind"],
-      "message": failurePayload["reason"]
+      "round": diagnostics["round"],
+      "failure_kind": diagnostics["failure_kind"],
+      "message": playerFailure["message"]
     }
     for slot, socket in state.playerSockets:
       var frame = copy(errorFrame)
@@ -298,19 +300,20 @@ proc abortEpisode(failurePayload: JsonNode) =
         discard
 
   if state.trajectory.isSome:
-    state.trajectory.get().finish(esFailed, failurePayload, newJNull())
+    state.trajectory.get().finish(esFailed, diagnostics, newJNull())
     state.trajectory.get().writeEventsToUri(getEnv("COGAME_SAVE_TRAJECTORY_URI"))
 
   let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
   if failureUri.len > 0:
     writeArtifact(
-      failureUri, $failurePayload, "application/json",
+      failureUri, $playerFailure, "application/json",
       "COGAME_PLAYER_FAILURE_METHOD"
     )
 
   sleep(200)
-  echo "gozu: episode aborted (", failurePayload["failure_kind"].getStr(),
-    "): ", failurePayload["reason"].getStr()
+  echo "gozu: episode aborted (seat ", playerFailure["failed_policy_index"].getInt(),
+    ", ", playerFailure["kind"].getStr(), ", ", diagnostics["failure_kind"].getStr(),
+    "): ", playerFailure["message"].getStr()
   quit(1)
 
 const PlayBudgetFraction* = 0.6
@@ -446,7 +449,8 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           break
         sleep(20)
 
-      var abortPayload: JsonNode = nil
+      var abortPlayerFailure: JsonNode = nil
+      var abortDiagnostics: JsonNode = nil
       withLock stateLock:
         var failedSeats: seq[int]
         for index, seat in seats:
@@ -475,6 +479,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
 
         if failedSeats.len > 0:
           var episodeKind = fkMissing
+          var failedPolicyIndex = -1
           var failedDetails = newJArray()
           var summaryParts: seq[string]
           for seat in failedSeats:
@@ -482,9 +487,15 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               if decisions[seat].failureKind != fkNone: decisions[seat].failureKind
               else: fkModel
             if kind == fkInfra:
-              episodeKind = fkInfra
+              if episodeKind != fkInfra:
+                episodeKind = fkInfra
+                failedPolicyIndex = seat
             elif kind == fkModel and episodeKind != fkInfra:
-              episodeKind = fkModel
+              if episodeKind != fkModel:
+                episodeKind = fkModel
+                failedPolicyIndex = seat
+            elif failedPolicyIndex < 0:
+              failedPolicyIndex = seat
             let cleanReason = cleanText(decisions[seat].failureReason, MaxErrorLen)
             echo "gozu: round ", state.sim.round + 1, " ",
               state.sim.names[seat], " failed (", kind, ": ", cleanReason, ")"
@@ -529,10 +540,16 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 status,
                 terminal = true
               )
-          abortPayload = %*{
+          let summaryMessage = summaryParts.join("; ")
+          abortPlayerFailure = playerFailureJson(
+            failedPolicyIndex, episodeKind, summaryMessage
+          )
+          abortDiagnostics = %*{
             "status": "failed",
+            "failed_policy_index": failedPolicyIndex,
+            "kind": playerFailureKind(episodeKind),
             "failure_kind": $episodeKind,
-            "reason": summaryParts.join("; "),
+            "reason": summaryMessage,
             "round": state.sim.round,
             "rounds_played": state.sim.roundsPlayed,
             "mode": $config.mode,
@@ -576,8 +593,8 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
              else: "")
           state.broadcastLocked()
 
-      if not abortPayload.isNil:
-        abortEpisode(abortPayload)
+      if not abortPlayerFailure.isNil:
+        abortEpisode(abortPlayerFailure, abortDiagnostics)
 
       ## Pace between rounds so spectators can read the table.
       if config.turnDelayMs > 0:
