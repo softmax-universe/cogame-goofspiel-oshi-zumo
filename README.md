@@ -27,8 +27,7 @@ still to come. The whole skill is budget pacing and opponent modelling.
 Prompt players send their strategy to the game. The server asks Claude for
 their bids in one parallel batch each round. External players receive a
 seat observation and return a sealed legal bid through the same player socket.
-Two built-in **scripted baselines** play any seat that registers as scripted. They also
-cover prompt seats when no game LLM credentials are available:
+Two built-in **scripted baselines** play any seat that explicitly registers as scripted:
 
 - **`match`** — bid the card of the same rank as the prize, else the cheapest
   card above it, else your highest. In oshi-zumo, spend the even rate that
@@ -52,6 +51,10 @@ scores +1. Oshi-Zumo: +1 / −1, and 0/0 on a draw. `results.reason` is
 `complete` or `deadline`; the finer ending rides in `results.ending`
 (`prizes-exhausted`, `pushout`, `coins-exhausted`, `round-cap`, `wall-clock`).
 A `deadline` episode is a real result — the game is fully scored at the stop.
+If a model or external player fails to submit a valid legal bid (rejected reply,
+disconnect, missed round deadline, or LLM transport/auth/credentials failure),
+the episode aborts unscored with failure diagnostics rather than substituting a
+fallback move or inventing forfeit scores.
 
 **The gasp.** One predicate in both modes: `overbid` when `margin >= 6`, the
 top bid over the best bid strictly below it. It gets its own event, its own
@@ -129,9 +132,10 @@ connecting. At each open round, the `state.observation` object gives the seat's
 legal bids, face-up prize or token position, public resources and bid history,
 and its own private notes. The player replies with
 `{"type":"bid","round":R,"bid":N,"say":"...","notes":"..."}`.
-The game accepts one legal bid for that round, reveals all bids together, and
-uses the `match` baseline if an external player does not reply before the
-round deadline.
+The game accepts one strict legal integer bid for that round, reveals all bids
+together, and aborts the episode unscored with failure diagnostics (never
+substituting a fallback move or inventing forfeit scores) if an external player
+sends a rejected reply, disconnects, or misses the round deadline.
 
 
 ## Private training evidence

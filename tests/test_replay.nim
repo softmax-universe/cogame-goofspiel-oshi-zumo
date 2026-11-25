@@ -134,6 +134,28 @@ suite "16 record -> re-derive, for every ending":
     check frames[^1].done
     check frames[^1].ending == "wall-clock"
 
+  test "per-turn notes in reveal while sim.notes carries forward":
+    var rec = start(goofConfig(seed = 29))
+    rec.sim.beginRound()
+    snap(rec)
+    rec.sim.applyBids(@[1, 2, 3, 4], @["hi", "", "", ""], @["save 4", "", "", ""],
+      newSeq[bool](4))
+    snap(rec)
+    rec.sim.beginRound()
+    snap(rec)
+    rec.sim.applyBids(@[2, 1, 4, 3], @["", "", "", ""], @["", "", "", ""],
+      newSeq[bool](4))
+    snap(rec)
+    var reveals: seq[GameEvent]
+    for event in rec.sim.events:
+      if event.kind == evReveal:
+        reveals.add(event)
+    check reveals.len == 2
+    check reveals[0].notes == @["save 4", "", "", ""]
+    check reveals[1].notes == @["", "", "", ""]
+    check rec.sim.notes == @["save 4", "", "", ""]
+    checkRederives(rec)
+
 # ---- 17: a tampered recording is a raised error, not a silent drift -------
 
 suite "17 replayMatch checks what it re-derives":
