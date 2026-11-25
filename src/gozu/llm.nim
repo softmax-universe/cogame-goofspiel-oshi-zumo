@@ -6,9 +6,9 @@
 ## Decisions in a round are SIMULTANEOUS by rule, so every open seat's call
 ## goes out as ONE parallel batch (curly.RequestBatch + makeRequests, the
 ## `decideAll` shape ported from cogame-bullwhip/src/bullwhip/llm.nim);
-## invalid replies are retried once with the legal set, and anything still
-## failing is reported as a failed decision (aborting the episode unscored)
-## rather than silently substituting a scripted move or inventing a forfeit.
+## failed requests or invalid replies are reported immediately as failed
+## decisions (aborting the episode unscored) without retrying model calls
+## or silently substituting a scripted move or inventing a forfeit.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
@@ -33,6 +33,7 @@ const
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
   DefaultBedrockModel* = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  MaxFailureMessageLen* = 2000
 
 type
   LlmInfraError* = object of GozuError
@@ -42,6 +43,27 @@ type
     fkModel = "model"
     fkMissing = "missing"
     fkInfra = "infrastructure"
+
+proc playerFailureKind*(kind: FailureKind): string =
+  ## Maps internal failure categories to Coworld's closed GamePlayerFailure kind.
+  case kind
+  of fkInfra: "episode_inconclusive"
+  else: "player_error"
+
+proc playerFailureJson*(failedPolicyIndex: int, kind: FailureKind,
+    message: string): JsonNode =
+  ## Builds Coworld's closed GamePlayerFailure JSON object.
+  doAssert failedPolicyIndex >= 0, "failed_policy_index must be nonnegative"
+  var cleaned = cleanText(message, MaxFailureMessageLen)
+  if cleaned.len == 0:
+    cleaned = "player failed"
+  %*{
+    "failed_policy_index": failedPolicyIndex,
+    "message": cleaned,
+    "kind": playerFailureKind(kind)
+  }
+
+type
 
   ScriptKind* = enum
     skNone = "none"
@@ -635,21 +657,16 @@ proc decideAll*(
       result[index].failureReason = "llm client disabled after auth failure"
     else:
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
+  if open.len > 0 and not client.disabled:
     var batch: RequestBatch
     var evidenceByIndex = newSeq[DecisionAttempt](seats.len)
     for index in open:
       let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\nYour previous reply was invalid. Respond with ONLY one " &
-          "JSON object; \"bid\" must be an integer from: " &
-          bidList(sim.legalBids(seat)) & ".")
-      let request = client.requestFor(systemPrompt(sim, seat, selection), user, seat)
-      evidenceByIndex[index] = newDecisionAttempt("attempt-" & $attempt, client.model, aoModel)
-      captureInferenceRequest(evidenceByIndex[index], parseJson(request.body), systemPrompt(sim, seat, selection), user)
+      let sys = systemPrompt(sim, seat, selection)
+      let user = sim.userPrompt(seat, prompts[seat])
+      let request = client.requestFor(sys, user, seat)
+      evidenceByIndex[index] = newDecisionAttempt("attempt-0", client.model, aoModel)
+      captureInferenceRequest(evidenceByIndex[index], parseJson(request.body), sys, user)
       batch.post(request.url, request.headers, request.body, $index)
     let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
     var stillOpen: seq[int]
@@ -662,12 +679,11 @@ proc decideAll*(
         captureInferenceResponse(evidence, response.body, response.code,
           response.headers["x-softmax-llm-call-id"], response.headers["x-coworld-checkpoint-sha256"],
           response.headers["x-coworld-tokenizer-sha256"], response.headers["x-coworld-chat-template-sha256"],
-          client.timeoutSeconds, 2)
+          client.timeoutSeconds, 1)
         raw = client.textOf(responses[position].response,
           responses[position].error, batch[position].url)
         var decision = parseDecision(extractJsonObject(raw), sim.config.mode)
-        ## Reject illegal bids here so the retry carries the hint. This is
-        ## the SAME predicate applyBids validates with.
+        ## Reject illegal bids here using the SAME predicate applyBids validates with.
         if decision.bid notin sim.legalBids(seat):
           raise newException(GozuError,
             "bid " & $decision.bid & " is not legal for this seat")
@@ -683,7 +699,7 @@ proc decideAll*(
           if error of LlmInfraError: fkInfra
           else: fkModel
         result[index].failureReason = error.msg
-        echo "gozu llm: seat ", seat, " attempt ", attempt, " failed (",
+        echo "gozu llm: seat ", seat, " failed (",
           result[index].failureKind, "): ", cleanText(error.msg, MaxErrorLen)
         stillOpen.add(index)
     open = stillOpen
