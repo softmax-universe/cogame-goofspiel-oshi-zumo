@@ -38,9 +38,12 @@
 #                              job loads it in a real browser -- that is the
 #                              only replay in CI that is known to be readable
 #                              by this game's own viewer.
-#   ANTHROPIC_API_KEY          if set, forwarded to the game so the LLM path
-#                              is exercised; if unset the game must fall back
-#                              to its scripted baselines and still complete
+#   ANTHROPIC_API_KEY          if set (or COWORLD_LLM_ENDPOINT / Bedrock creds),
+#                              forwarded to the game and the certification seat
+#                              mix (including the native LLM player) is used;
+#                              if unset, the offline smoke explicitly seats
+#                              goofspiel-oshi-zumo-scripted in all slots so no
+#                              silent fallback is ever required.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -161,9 +164,21 @@ with open(os.path.join(work, "config.json"), "w") as fh:
 
 by_id = {p.get("id"): p for p in (manifest.get("player") or [])}
 extra_env = [kv for kv in (os.environ.get("SMOKE_EXTRA_ENV") or "").split() if "=" in kv]
+has_llm_creds = any(
+    bool((os.environ.get(k) or "").strip())
+    for k in (
+        "ANTHROPIC_API_KEY",
+        "COWORLD_LLM_ENDPOINT",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+    )
+)
+use_cert_players = has_llm_creds or (os.environ.get("SMOKE_USE_CERT_PLAYERS") in ("1", "true", "yes"))
+offline_scripted_id = os.environ.get("SMOKE_SCRIPTED_PLAYER_ID", "goofspiel-oshi-zumo-scripted")
 
 for slot in range(seats):
-    player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
+    cert_player_id = cert_players[slot].get("player_id") if slot < len(cert_players) else None
+    player_id = cert_player_id if use_cert_players else offline_scripted_id
     entry = by_id.get(player_id) or {}
     env_args = []
     for key, value in (entry.get("env") or {}).items():
@@ -175,7 +190,8 @@ for slot in range(seats):
         fh.write(" ".join(shlex.quote(a) for a in env_args))
     with open(os.path.join(work, f"cmd-{slot}.args"), "w") as fh:
         fh.write(" ".join(shlex.quote(a) for a in argv))
-    print(f"slot {slot}: player_id={player_id or '(default)'} run={argv} env={len(env_args) // 2}")
+    mode_note = "" if use_cert_players else f" (offline scripted smoke; cert={cert_player_id})"
+    print(f"slot {slot}: player_id={player_id or '(default)'}{mode_note} run={argv} env={len(env_args) // 2}")
 
 with open(os.path.join(work, "seats"), "w") as fh:
     fh.write(str(seats))
@@ -193,9 +209,23 @@ docker network create "${network}" >/dev/null
 game_env=()
 if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
+fi
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+fi
+if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+fi
+if [ -n "${AWS_BEARER_TOKEN_BEDROCK:-}" ]; then
+  game_env+=(-e "AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK}")
+fi
+if [ -n "${AWS_ENDPOINT_URL_BEDROCK_RUNTIME:-}" ]; then
+  game_env+=(-e "AWS_ENDPOINT_URL_BEDROCK_RUNTIME=${AWS_ENDPOINT_URL_BEDROCK_RUNTIME}")
+fi
+if [ "${#game_env[@]}" -gt 0 ]; then
+  echo "LLM credentials present: the certification seat mix and LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  echo "no LLM credentials: running explicit offline scripted smoke (goofspiel-oshi-zumo-scripted)"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."

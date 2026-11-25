@@ -127,20 +127,33 @@ suite "22 the 0.1.42+ upload contract":
     doAssert manifest{"game"}{"runnable"}{"env"}{"ANTHROPIC_API_KEY_URI"}.isNil,
       "hosted LLM uses the platform sidecar without provider secrets"
 
-suite "23 player roster and purely scripted offline certification":
-  test "native model player is first, scripted baseline is separate, and certification is scripted":
+suite "23 player roster, LLM env, and release certification seating":
+  test "native model player is first, LLM env is explicit, and certification seats every declared ID":
+    let gameEnv = manifest["game"]["runnable"]["env"]
+    check gameEnv["COWORLD_LLM_ENABLED"].getStr() == "true"
+    check gameEnv["COWORLD_LLM_MODEL"].getStr() == "anthropic/claude-haiku-4.5"
+
     let players = manifest["player"]
     check players.len == 2
     check players[0]["id"].getStr() == "goofspiel-oshi-zumo-player"
     check players[0]["run"].to(seq[string]) == @["/bin/goofspiel-oshi-zumo-player"]
     check players[0]{"env"}{"PLAYER_SCRIPTED"}.isNil
+    check players[0]["env"]["COWORLD_LLM_ENABLED"].getStr() == "true"
+    check players[0]["env"]["COWORLD_LLM_MODEL"].getStr() == "anthropic/claude-haiku-4.5"
+
     check players[1]["id"].getStr() == "goofspiel-oshi-zumo-scripted"
     check players[1]["run"].to(seq[string]) == @["/bin/goofspiel-oshi-zumo-player"]
     check players[1]["env"]["PLAYER_SCRIPTED"].getStr() == "match"
+    check players[1]{"env"}{"COWORLD_LLM_ENABLED"}.isNil
+
     var declared: seq[string]
     for player in players:
       declared.add(player["id"].getStr())
+    var seated: seq[string]
     for slot in manifest["certification"]["players"]:
       let id = slot["player_id"].getStr()
       check id in declared
-      check id == "goofspiel-oshi-zumo-scripted"
+      seated.add(id)
+    for id in declared:
+      checkpoint(id)
+      check id in seated

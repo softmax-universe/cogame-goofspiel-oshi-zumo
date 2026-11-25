@@ -24,7 +24,10 @@
       "run": [
         "/bin/goofspiel-oshi-zumo"
       ],
-      "env": {},
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "source_url": "https://github.com/softmax-universe/cogame-goofspiel-oshi-zumo/tree/main"
     },
     "config_schema": {
@@ -337,6 +340,10 @@
       "run": [
         "/bin/goofspiel-oshi-zumo-player"
       ],
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "resources": {
         "requests": {
           "cpu": "100m",
@@ -450,7 +457,7 @@
     },
     "players": [
       {
-        "player_id": "goofspiel-oshi-zumo-scripted"
+        "player_id": "goofspiel-oshi-zumo-player"
       },
       {
         "player_id": "goofspiel-oshi-zumo-scripted"
